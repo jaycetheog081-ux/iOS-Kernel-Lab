@@ -1,0 +1,41 @@
+name: Inspect iOS Firmware
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    name: Inspect iPhone 13 iOS 27.0
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Show available disk space
+        run: |
+          set -euo pipefail
+          df -h .
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Inspect firmware
+        run: |
+          set -euo pipefail
+          python scripts/inspect_ipsw.py
+
+      - name: Upload inspection reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-firmware-report
+          path: reports/
+          if-no-files-found: warn
+          retention-days: 7
