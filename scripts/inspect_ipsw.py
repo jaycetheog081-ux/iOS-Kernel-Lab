@@ -3,326 +3,468 @@
 import hashlib
 import json
 import os
+import plistlib
+import shutil
 import sys
+import time
 import urllib.error
 import urllib.request
 import zipfile
-from datetime import datetime, timezone
+
 from pathlib import Path
+from urllib.parse import urlparse
 
 
 DEVICE = "iPhone14,5"
 IOS_VERSION = "27.0"
-BUILD = "24A437"
+BUILD_VERSION = "24A437"
 
-ROOT = Path(os.environ.get("RUNNER_TEMP", ".")) / "ios-kernel-lab"
-FIRMWARE_DIR = ROOT / "firmware"
-REPORT_DIR = Path("reports")
+ROOT = Path(__file__).resolve().parent.parent
+REPORTS = ROOT / "reports"
+KERNEL_DIR = REPORTS / "kernelcache"
 
-API_URL = f"https://api.ipsw.me/v4/device/{DEVICE}?type=ipsw"
-
-KERNEL_TERMS = (
-    "kernelcache",
-    "kernelcollection",
-    "kernel",
-    "kernels",
+WORK_DIR = (
+    Path(os.environ.get("RUNNER_TEMP", "/tmp"))
+    / "ios-kernel-lab"
+    / "firmware"
 )
 
-SECURITY_TERMS = (
-    "trustcache",
-    "trust_cache",
-    "endpointsecurity",
-    "devicetree",
-    "sep-firmware",
-    "buildmanifest.plist",
-    "restore.plist",
+API_URL = (
+    f"https://api.ipsw.me/v4/device/{DEVICE}?type=ipsw"
 )
+
+USER_AGENT = "iOS-Kernel-Lab/1.0"
+
+
+def log(message):
+    print(f"[iOS-Kernel-Lab] {message}", flush=True)
 
 
 def fetch_json(url):
     request = urllib.request.Request(
         url,
-        headers={"User-Agent": "iOS-Kernel-Lab/1.0"},
+        headers={"User-Agent": USER_AGENT},
     )
 
     with urllib.request.urlopen(request, timeout=60) as response:
         return json.load(response)
 
 
-def select_firmware(data):
-    matches = [
-        item
-        for item in data.get("firmwares", [])
-        if item.get("version") == IOS_VERSION
-        and item.get("buildid") == BUILD
-    ]
-
-    if not matches:
-        available = [
-            f"{item.get('version')} ({item.get('buildid')})"
-            for item in data.get("firmwares", [])
-        ]
-
-        raise RuntimeError(
-            f"Firmware {IOS_VERSION} ({BUILD}) was not found for "
-            f"{DEVICE}. Available entries: {available[:20]}"
-        )
-
-    return matches[0]
-
-
-def download_file(url, destination):
-    destination.parent.mkdir(parents=True, exist_ok=True)
-
-    request = urllib.request.Request(
-        url,
-        headers={"User-Agent": "iOS-Kernel-Lab/1.0"},
-    )
-
-    with urllib.request.urlopen(request, timeout=120) as response:
-        with destination.open("wb") as output:
-            while True:
-                chunk = response.read(1024 * 1024)
-
-                if not chunk:
-                    break
-
-                output.write(chunk)
-
-
 def sha256_file(path):
     digest = hashlib.sha256()
 
-    with path.open("rb") as source:
+    with path.open("rb") as file:
         while True:
-            chunk = source.read(8 * 1024 * 1024)
+            block = file.read(8 * 1024 * 1024)
 
-            if not chunk:
+            if not block:
                 break
 
-            digest.update(chunk)
+            digest.update(block)
 
     return digest.hexdigest()
 
 
-def inspect_archive(path):
-    report = {
-        "archive_entries": [],
-        "kernel_candidates": [],
-        "security_candidates": [],
-        "build_manifest": None,
-        "warnings": [],
-    }
+def download_file(url, destination, expected_size=None):
+    destination.parent.mkdir(parents=True, exist_ok=True)
 
-    with zipfile.ZipFile(path, "r") as archive:
-        for item in archive.infolist():
-            name = item.filename
-            lowered = name.lower()
+    request = urllib.request.Request(
+        url,
+        headers={"User-Agent": USER_AGENT},
+    )
 
-            entry = {
-                "name": name,
-                "size_bytes": item.file_size,
-                "compressed_size_bytes": item.compress_size,
-            }
+    log(f"Downloading firmware to {destination}")
+    log("The IPSW is approximately 11 GB; this may take a while.")
 
-            report["archive_entries"].append(entry)
+    temporary = destination.with_suffix(".download")
 
-            if any(term in lowered for term in KERNEL_TERMS):
-                report["kernel_candidates"].append(entry)
+    try:
+        with urllib.request.urlopen(request, timeout=120) as response:
+            total = response.headers.get("Content-Length")
 
-            if any(term in lowered for term in SECURITY_TERMS):
-                report["security_candidates"].append(entry)
+            if total:
+                total = int(total)
+            elif expected_size:
+                total = int(expected_size)
 
-        try:
-            import plistlib
+            downloaded = 0
+            last_report = 0
 
-            with archive.open("BuildManifest.plist") as stream:
-                manifest = plistlib.load(stream)
+            with temporary.open("wb") as output:
+                while True:
+                    block = response.read(8 * 1024 * 1024)
 
-            report["build_manifest"] = {
-                "ProductVersion": manifest.get("ProductVersion"),
-                "ProductBuildVersion": manifest.get(
-                    "ProductBuildVersion"
-                ),
-                "SupportedProductTypes": manifest.get(
-                    "SupportedProductTypes", []
-                ),
-                "BuildIdentities": [],
-            }
+                    if not block:
+                        break
 
-            for identity in manifest.get("BuildIdentities", []):
-                info = identity.get("Info", {})
+                    output.write(block)
+                    downloaded += len(block)
 
-                report["build_manifest"]["BuildIdentities"].append({
-                    "DeviceClass": info.get("DeviceClass"),
-                    "RestoreBehavior": info.get("RestoreBehavior"),
-                    "Variant": info.get("Variant"),
-                    "ApBoardID": info.get("ApBoardID"),
-                    "ApChipID": info.get("ApChipID"),
-                })
+                    now = time.monotonic()
 
-        except (KeyError, ValueError, zipfile.BadZipFile) as exc:
-            report["warnings"].append(
-                f"Could not parse BuildManifest.plist: {exc}"
+                    if now - last_report >= 15:
+                        if total:
+                            percent = downloaded * 100 / total
+                            log(
+                                f"Download: {percent:.1f}% "
+                                f"({downloaded:,}/{total:,} bytes)"
+                            )
+                        else:
+                            log(f"Downloaded {downloaded:,} bytes")
+
+                        last_report = now
+
+        if expected_size and downloaded != int(expected_size):
+            raise RuntimeError(
+                f"Download size mismatch: expected {expected_size}, "
+                f"received {downloaded}"
             )
 
-    return report
+        temporary.replace(destination)
+
+    finally:
+        if temporary.exists():
+            temporary.unlink()
+
+    log(f"Download complete: {downloaded:,} bytes")
+
+
+def locate_firmware():
+    log(f"Checking IPSW.me for {DEVICE}, iOS {IOS_VERSION}")
+
+    data = fetch_json(API_URL)
+    firmwares = data.get("firmwares", [])
+
+    for firmware in firmwares:
+        if (
+            firmware.get("version") == IOS_VERSION
+            and firmware.get("buildid") == BUILD_VERSION
+        ):
+            if firmware.get("signed") is False:
+                log(
+                    "Warning: IPSW.me reports this firmware "
+                    "as unsigned."
+                )
+
+            return firmware
+
+    raise RuntimeError(
+        f"Could not find iOS {IOS_VERSION} build {BUILD_VERSION} "
+        f"for {DEVICE} in the IPSW.me response. "
+        "The listing may have changed or the target may be unavailable."
+    )
+
+
+def find_kernel_entry(archive):
+    candidates = []
+
+    for info in archive.infolist():
+        name = info.filename.rsplit("/", 1)[-1]
+
+        if name.startswith("kernelcache"):
+            candidates.append(info)
+
+    if not candidates:
+        raise RuntimeError(
+            "No kernelcache entry was found in the IPSW."
+        )
+
+    # Prefer the expected iPhone 13 kernelcache name.
+    candidates.sort(
+        key=lambda item: (
+            item.filename.rsplit("/", 1)[-1]
+            != "kernelcache.release.iphone14",
+            item.file_size,
+        )
+    )
+
+    return candidates[0]
+
+
+def extract_member(archive, info, destination):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    log(f"Extracting {info.filename}")
+    log(f"Uncompressed size: {info.file_size:,} bytes")
+
+    with archive.open(info, "r") as source:
+        with destination.open("wb") as output:
+            shutil.copyfileobj(
+                source,
+                output,
+                length=8 * 1024 * 1024,
+            )
+
+    actual_size = destination.stat().st_size
+
+    if actual_size != info.file_size:
+        raise RuntimeError(
+            f"Extracted size mismatch: expected {info.file_size}, "
+            f"received {actual_size}"
+        )
+
+    log(f"Extracted kernelcache to {destination}")
+
+
+def describe_file(path):
+    with path.open("rb") as file:
+        header = file.read(64)
+
+    printable = "".join(
+        chr(byte) if 32 <= byte < 127 else "."
+        for byte in header
+    )
+
+    return {
+        "size_bytes": path.stat().st_size,
+        "sha256": sha256_file(path),
+        "first_64_bytes_hex": header.hex(),
+        "first_64_bytes_ascii": printable,
+    }
+
+
+def read_build_manifest(archive):
+    matches = [
+        info
+        for info in archive.infolist()
+        if info.filename.rsplit("/", 1)[-1] == "BuildManifest.plist"
+    ]
+
+    if not matches:
+        return None
+
+    with archive.open(matches[0], "r") as source:
+        manifest = plistlib.load(source)
+
+    return {
+        "ProductVersion": manifest.get("ProductVersion"),
+        "ProductBuildVersion": manifest.get(
+            "ProductBuildVersion"
+        ),
+        "SupportedProductTypes": manifest.get(
+            "SupportedProductTypes", []
+        ),
+    }
 
 
 def main():
-    print(f"Querying firmware metadata for {DEVICE}...")
+    REPORTS.mkdir(parents=True, exist_ok=True)
+    KERNEL_DIR.mkdir(parents=True, exist_ok=True)
+    WORK_DIR.mkdir(parents=True, exist_ok=True)
 
-    data = fetch_json(API_URL)
-    firmware = select_firmware(data)
+    firmware = locate_firmware()
 
-    url = firmware.get("url")
-    if not url:
-        raise RuntimeError("The firmware listing has no download URL.")
+    download_url = firmware.get("url")
+
+    if not download_url:
+        raise RuntimeError(
+            "IPSW.me did not provide a download URL."
+        )
 
     filename = (
-        firmware.get("filename")
-        or f"{DEVICE}_{IOS_VERSION}_{BUILD}_Restore.ipsw"
+        f"{DEVICE}_{IOS_VERSION}_{BUILD_VERSION}_Restore.ipsw"
     )
 
-    expected_sha256 = firmware.get("sha256sum")
+    ipsw_path = WORK_DIR / filename
 
-    FIRMWARE_DIR.mkdir(parents=True, exist_ok=True)
-    REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    expected_size = firmware.get("filesize")
 
-    ipsw_path = FIRMWARE_DIR / filename
+    if not ipsw_path.exists():
+        free_bytes = shutil.disk_usage(WORK_DIR).free
 
-    print(f"Selected: {filename}")
-    print(f"Device: {DEVICE}")
-    print(f"Version: {IOS_VERSION}")
-    print(f"Build: {BUILD}")
+        if expected_size:
+            required = int(expected_size) + 512 * 1024 * 1024
 
-    print("Downloading firmware directly to the runner...")
-    download_file(url, ipsw_path)
+            if free_bytes < required:
+                raise RuntimeError(
+                    "Insufficient free disk space. "
+                    f"Available: {free_bytes:,} bytes; "
+                    f"required approximately: {required:,} bytes. "
+                    "The runner needs room for the IPSW and "
+                    "temporary extraction files."
+                )
 
-    print("Calculating SHA-256...")
-    actual_sha256 = sha256_file(ipsw_path)
+        download_file(
+            download_url,
+            ipsw_path,
+            expected_size=expected_size,
+        )
+    else:
+        log("A previously downloaded IPSW exists.")
+
+    log("Calculating IPSW SHA-256.")
+    ipsw_sha256 = sha256_file(ipsw_path)
+
+    expected_sha256 = (
+        firmware.get("sha256")
+        or firmware.get("sha-256")
+    )
 
     checksum_verified = None
 
     if expected_sha256:
         checksum_verified = (
-            actual_sha256.lower() == expected_sha256.lower()
+            ipsw_sha256.lower() == expected_sha256.lower()
         )
 
         if not checksum_verified:
             raise RuntimeError(
-                "SHA-256 mismatch. The downloaded firmware does not "
-                "match the checksum in the firmware listing."
+                "IPSW SHA-256 mismatch. Stopping analysis."
             )
 
-        print("SHA-256 verification passed.")
+        log("IPSW SHA-256 verification passed.")
     else:
-        print(
-            "WARNING: No SHA-256 checksum was supplied by the API. "
-            "The calculated hash is recorded but not independently "
-            "verified."
+        log(
+            "IPSW.me did not supply a SHA-256 value. "
+            "The local SHA-256 will be recorded, but "
+            "independent SHA-256 verification is unavailable."
         )
 
-    print("Inspecting archive contents...")
-    inventory = inspect_archive(ipsw_path)
+    kernel_output = None
 
-    manifest = inventory.get("build_manifest") or {}
+    with zipfile.ZipFile(ipsw_path, "r") as archive:
+        bad_member = archive.testzip()
 
-    manifest_version = manifest.get("ProductVersion")
-    manifest_build = manifest.get("ProductBuildVersion")
+        if bad_member:
+            raise RuntimeError(
+                f"ZIP integrity check failed at {bad_member}"
+            )
 
-    if manifest_version and manifest_version != IOS_VERSION:
-        raise RuntimeError(
-            f"Manifest version mismatch: {manifest_version}"
+        manifest = read_build_manifest(archive)
+
+        if manifest:
+            if (
+                manifest.get("ProductVersion") != IOS_VERSION
+                or manifest.get("ProductBuildVersion")
+                != BUILD_VERSION
+                or DEVICE not in manifest.get(
+                    "SupportedProductTypes", []
+                )
+            ):
+                raise RuntimeError(
+                    "BuildManifest.plist does not match "
+                    "the configured device and firmware."
+                )
+
+        kernel_info = find_kernel_entry(archive)
+
+        kernel_name = kernel_info.filename.rsplit("/", 1)[-1]
+
+        kernel_output = KERNEL_DIR / kernel_name
+
+        extract_member(
+            archive,
+            kernel_info,
+            kernel_output,
         )
 
-    if manifest_build and manifest_build != BUILD:
-        raise RuntimeError(
-            f"Manifest build mismatch: {manifest_build}"
-        )
+        security_entries = []
+
+        for info in archive.infolist():
+            name = info.filename.lower()
+
+            if any(
+                term in name
+                for term in (
+                    "trustcache",
+                    "trust_cache",
+                    "devicetree",
+                    "sep-firmware",
+                )
+            ):
+                security_entries.append({
+                    "name": info.filename,
+                    "size_bytes": info.file_size,
+                })
+
+    kernel_metadata = describe_file(kernel_output)
 
     report = {
-        "generated_utc": datetime.now(timezone.utc).isoformat(),
-        "target": {
-            "device": "iPhone 13",
-            "identifier": DEVICE,
-            "ios_version": IOS_VERSION,
-            "build": BUILD,
+        "device": DEVICE,
+        "ios_version": IOS_VERSION,
+        "build": BUILD_VERSION,
+        "firmware_filename": filename,
+        "firmware_size_bytes": ipsw_path.stat().st_size,
+        "firmware_sha256": ipsw_sha256,
+        "expected_sha256_from_api": expected_sha256,
+        "checksum_verified_against_api": checksum_verified,
+        "build_manifest": manifest,
+        "kernelcache": {
+            "archive_path": kernel_info.filename,
+            "extracted_path": str(
+                kernel_output.relative_to(ROOT)
+            ),
+            **kernel_metadata,
         },
-        "firmware_listing": {
-            "source": API_URL,
-            "url": url,
-            "filename": filename,
-            "listed_size_bytes": firmware.get("filesize"),
-            "listed_sha256": expected_sha256,
-            "actual_sha256": actual_sha256,
-            "sha256_verified": checksum_verified,
-            "signed": firmware.get("signed"),
-            "release_date": firmware.get("releasedate"),
-        },
-        "actual_file_size_bytes": ipsw_path.stat().st_size,
-        **inventory,
-        "analysis_limitations": [
-            "Archive inventory is not vulnerability discovery.",
-            "Filename matching can miss files with unexpected names.",
-            "Nested images and kernel binaries have not been deeply analyzed.",
-            "A suspicious component is not proof of an exploitable flaw.",
-        ],
+        "security_related_entries": security_entries,
+        "analysis_status": (
+            "Kernelcache extracted and fingerprinted. "
+            "No vulnerability determination has been made."
+        ),
     }
 
-    json_path = REPORT_DIR / "ios-firmware-inventory.json"
-    text_path = REPORT_DIR / "ios-firmware-inventory.txt"
-
+    json_path = REPORTS / "kernel-analysis.json"
     json_path.write_text(
         json.dumps(report, indent=2),
         encoding="utf-8",
     )
 
+    text_path = REPORTS / "kernel-analysis.txt"
+
     lines = [
-        "iOS Firmware Inventory",
-        "======================",
+        "iOS Kernelcache Analysis",
+        "========================",
         "",
         f"Device: {DEVICE}",
         f"iOS version: {IOS_VERSION}",
-        f"Build: {BUILD}",
-        f"File: {filename}",
-        f"Size: {ipsw_path.stat().st_size:,} bytes",
-        f"SHA-256: {actual_sha256}",
-        f"Checksum verified: {checksum_verified}",
+        f"Build: {BUILD_VERSION}",
+        f"IPSW size: {ipsw_path.stat().st_size:,} bytes",
+        f"IPSW SHA-256: {ipsw_sha256}",
+        f"Checksum verified against API: {checksum_verified}",
         "",
         "BUILD MANIFEST",
         "--------------",
-        json.dumps(report["build_manifest"], indent=2),
+        json.dumps(manifest, indent=2),
         "",
-        "KERNEL CANDIDATES",
-        "-----------------",
+        "KERNELCACHE",
+        "-----------",
+        f"Archive entry: {kernel_info.filename}",
+        f"Extracted file: {kernel_output}",
+        f"Size: {kernel_metadata['size_bytes']:,} bytes",
+        f"SHA-256: {kernel_metadata['sha256']}",
+        f"First 64 bytes (hex): "
+        f"{kernel_metadata['first_64_bytes_hex']}",
+        f"First 64 bytes (ASCII): "
+        f"{kernel_metadata['first_64_bytes_ascii']}",
+        "",
+        "SECURITY-RELATED ARCHIVE ENTRIES",
+        "--------------------------------",
     ]
 
-    for entry in report["kernel_candidates"]:
+    for item in security_entries:
         lines.append(
-            f"{entry['name']} ({entry['size_bytes']:,} bytes)"
+            f"{item['name']} ({item['size_bytes']:,} bytes)"
         )
 
-    lines.extend(["", "SECURITY-RELATED CANDIDATES", "---------------------------"])
+    lines.extend([
+        "",
+        "INTERPRETATION",
+        "--------------",
+        "This stage extracts and fingerprints the kernelcache.",
+        "It does not prove the existence or absence of a vulnerability.",
+        "The kernelcache may require additional format-aware parsing.",
+        "",
+    ])
 
-    for entry in report["security_candidates"]:
-        lines.append(
-            f"{entry['name']} ({entry['size_bytes']:,} bytes)"
-        )
-
-    lines.extend(["", "WARNINGS", "--------"])
-
-    lines.extend(
-        report["warnings"] or ["No inventory warnings."]
+    text_path.write_text(
+        "\n".join(lines),
+        encoding="utf-8",
     )
 
-    text_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-    print(f"JSON report: {json_path}")
-    print(f"Text report: {text_path}")
-    print(f"Archive entries: {len(report['archive_entries'])}")
-    print(f"Kernel candidates: {len(report['kernel_candidates'])}")
-    print(f"Security candidates: {len(report['security_candidates'])}")
+    log(f"Created {json_path}")
+    log(f"Created {text_path}")
+    log(f"Kernelcache SHA-256: {kernel_metadata['sha256']}")
+    log("Kernelcache extraction completed successfully.")
 
 
 if __name__ == "__main__":
@@ -331,9 +473,11 @@ if __name__ == "__main__":
     except (
         OSError,
         ValueError,
+        KeyError,
         RuntimeError,
         urllib.error.URLError,
         zipfile.BadZipFile,
-    ) as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        plistlib.InvalidFileException,
+    ) as error:
+        print(f"ERROR: {error}", file=sys.stderr)
         sys.exit(1)
