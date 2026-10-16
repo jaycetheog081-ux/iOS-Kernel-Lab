@@ -1,0 +1,169 @@
+name: Targeted Kernel Triage
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "Run ID of the successful Analyze Kernelcache workflow"
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  triage:
+    name: Review kernel security indicators
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Download previous analysis artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-kernel-static-analysis
+          path: input-artifact
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_run_id }}
+
+      - name: Generate targeted triage report
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p reports
+
+          STRINGS_FILE="$(find input-artifact -type f \
+            -name 'kernel-strings.txt' -print -quit)"
+
+          if [ -z "$STRINGS_FILE" ]; then
+            echo "ERROR: kernel-strings.txt was not found in the artifact."
+            echo "Artifact contents:"
+            find input-artifact -type f -print
+            exit 1
+          fi
+
+          python3 - "$STRINGS_FILE" reports/kernel-triage.txt <<'PY'
+          import collections
+          import pathlib
+          import re
+          import sys
+
+          source = pathlib.Path(sys.argv[1])
+          output = pathlib.Path(sys.argv[2])
+
+          rules = {
+              "Memory management": re.compile(
+                  r'\b(pmap|vm_map|vm_fault|copyin|copyout|'
+                  r'copyinstr|bounded_ptr|overflow|underflow)\b',
+                  re.I
+              ),
+              "Mach IPC": re.compile(
+                  r'\b(mach_msg|ipc_kmsg|ipc_port|mach_port|'
+                  r'ipc_space|message size)\b',
+                  re.I
+              ),
+              "Driver user-client interfaces": re.compile(
+                  r'\b(IOUserClient|externalMethod|'
+                  r'IOExternalMethodDispatch|IOConnectCall)\b',
+                  re.I
+              ),
+              "Input and firmware handling": re.compile(
+                  r'\b(FirmwareUpdateUserClient|validateFirmware|'
+                  r'bufferLength|buffer.*bounds|'
+                  r'Image4|IOBufferMemoryDescriptor)\b',
+                  re.I
+              ),
+              "Security enforcement": re.compile(
+                  r'\b(AppleMobileFileIntegrity|codesign|'
+                  r'code signing|sandbox|entitlement|'
+                  r'AMFI|trust cache)\b',
+                  re.I
+              ),
+              "Concurrency and object lifetime": re.compile(
+                  r'\b(use.after.free|race condition|'
+                  r'workloop|commandGate|retainCount|'
+                  r'release.*object|double.free)\b',
+                  re.I
+              ),
+          }
+
+          counts = collections.Counter()
+          matches = {name: [] for name in rules}
+          total_lines = 0
+          total_strings = 0
+          max_per_category = 150
+
+          with source.open("r", errors="replace") as stream:
+              for line_number, raw in enumerate(stream, 1):
+                  total_lines += 1
+                  line = raw.rstrip("\r\n")
+
+                  if not line:
+                      continue
+
+                  total_strings += 1
+
+                  for category, pattern in rules.items():
+                      if pattern.search(line):
+                          counts[category] += 1
+                          if len(matches[category]) < max_per_category:
+                              matches[category].append(
+                                  (line_number, line[:1000])
+                              )
+
+          with output.open("w") as report:
+              report.write("iOS Kernel Targeted Static Triage\n")
+              report.write("=" * 36 + "\n\n")
+              report.write(f"Input: {source}\n")
+              report.write(f"Lines scanned: {total_lines}\n")
+              report.write(f"Non-empty strings: {total_strings}\n\n")
+              report.write(
+                  "IMPORTANT: Pattern matches are review leads, not "
+                  "confirmed vulnerabilities.\n"
+              )
+              report.write(
+                  "String-only analysis cannot establish reachability, "
+                  "exploitability, or missing validation.\n"
+              )
+
+              for category in rules:
+                  report.write(f"\n\n{category}\n")
+                  report.write("-" * len(category) + "\n")
+                  report.write(
+                      f"Matching lines: {counts[category]}\n"
+                  )
+
+                  if not matches[category]:
+                      report.write("No matching strings found.\n")
+                      continue
+
+                  for line_number, value in matches[category]:
+                      safe_value = value.encode(
+                          "ascii", errors="backslashreplace"
+                      ).decode("ascii")
+                      report.write(
+                          f"[line {line_number}] {safe_value}\n"
+                      )
+
+                  if counts[category] > max_per_category:
+                      report.write(
+                          f"... output capped at {max_per_category} "
+                          "examples for this category.\n"
+                      )
+
+          print(f"Created {output}")
+          print(f"Scanned {total_lines} lines.")
+          for category in rules:
+              print(f"{category}: {counts[category]} matches")
+          PY
+
+      - name: Upload triage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-kernel-targeted-triage
+          path: reports/kernel-triage.txt
+          if-no-files-found: error
+          retention-days: 14
