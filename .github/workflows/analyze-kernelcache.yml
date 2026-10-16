@@ -44,7 +44,6 @@ jobs:
 
           if [ -z "$KERNEL" ]; then
             echo "::error::Kernelcache not found in downloaded artifact."
-            echo "Artifact contents:"
             find input-artifact -maxdepth 5 -type f -print
             exit 1
           fi
@@ -53,8 +52,6 @@ jobs:
 
           echo "Found kernelcache:"
           ls -lh "$KERNEL"
-
-          echo "SHA-256:"
           sha256sum "$KERNEL"
 
       - name: Install ipsw analysis tool
@@ -62,10 +59,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo snap install ipsw
-
           ipsw version || ipsw --version || true
-          ipsw kernel dec --help
-          ipsw kernel version --help
 
       - name: Prepare output directory
         run: mkdir -p reports/kernel-analysis
@@ -106,32 +100,45 @@ jobs:
         run: |
           set -euo pipefail
 
-          OUTPUT="reports/kernel-analysis/kernelcache.dec"
+          OUTPUT_DIR="reports/kernel-analysis/kernelcache.dec"
+          mkdir -p "$OUTPUT_DIR"
 
-          ipsw kernel dec "$KERNEL_PATH" --output "$OUTPUT"
+          ipsw kernel dec "$KERNEL_PATH" --output "$OUTPUT_DIR"
 
-          if [ ! -s "$OUTPUT" ]; then
-            echo "::error::Decompression did not produce a non-empty file."
+          DECODED="$(find "$OUTPUT_DIR" \
+            -type f \
+            -name '*.decompressed' \
+            -print -quit)"
+
+          if [ -z "$DECODED" ]; then
+            echo "::error::No decompressed kernel file was found."
+            find "$OUTPUT_DIR" -maxdepth 4 -print
             exit 1
           fi
+
+          if [ ! -s "$DECODED" ]; then
+            echo "::error::The decompressed kernel file is empty."
+            exit 1
+          fi
+
+          echo "decoded_path=$DECODED" >> "$GITHUB_OUTPUT"
 
           {
             echo
             echo "DECOMPRESSION"
             echo "-------------"
             echo "Status: completed"
-            echo "Output: $OUTPUT"
+            echo "Output: $DECODED"
+            echo
             echo "Size:"
-            stat -c '%s bytes' "$OUTPUT"
+            stat -c '%s bytes' "$DECODED"
             echo
             echo "SHA-256:"
-            sha256sum "$OUTPUT"
+            sha256sum "$DECODED"
             echo
             echo "First 32 bytes:"
-            od -An -tx1 -N32 "$OUTPUT"
+            od -An -tx1 -N32 "$DECODED"
           } >> reports/kernel-analysis/kernelcache-report.txt
-
-          echo "decoded_path=$OUTPUT" >> "$GITHUB_OUTPUT"
 
       - name: Extract kernel version metadata
         if: steps.decompress.outcome == 'success'
@@ -141,14 +148,23 @@ jobs:
         run: |
           set -euo pipefail
 
-          ipsw kernel version "$DECODED_PATH" --json \
-            > reports/kernel-analysis/kernel-version.json
+          if ipsw kernel version --help 2>&1 | grep -q -- '--json'; then
+            ipsw kernel version "$DECODED_PATH" --json \
+              > reports/kernel-analysis/kernel-version.json
+          else
+            ipsw kernel version "$DECODED_PATH" \
+              > reports/kernel-analysis/kernel-version.txt
+          fi
 
           {
             echo
             echo "KERNEL VERSION METADATA"
             echo "-----------------------"
-            cat reports/kernel-analysis/kernel-version.json
+            if [ -f reports/kernel-analysis/kernel-version.json ]; then
+              cat reports/kernel-analysis/kernel-version.json
+            else
+              cat reports/kernel-analysis/kernel-version.txt
+            fi
           } >> reports/kernel-analysis/kernelcache-report.txt
 
       - name: Collect readable kernel strings
@@ -183,7 +199,7 @@ jobs:
           echo "Generated analysis files:"
           if [ -d reports/kernel-analysis ]; then
             find reports/kernel-analysis \
-              -maxdepth 2 \
+              -maxdepth 4 \
               -type f \
               -printf '%p (%s bytes)\n'
           fi
