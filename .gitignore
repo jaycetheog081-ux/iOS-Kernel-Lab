@@ -1,0 +1,19 @@
+# Downloaded firmware
+*.ipsw
+
+# Extracted firmware and disk images
+*.dmg
+*.img
+*.aea
+
+# Local analysis output
+firmware/
+reports/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local tooling
+.DS_Store
