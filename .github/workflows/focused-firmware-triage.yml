@@ -1,0 +1,168 @@
+name: Focused Firmware Interface Triage
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: focused-firmware-triage
+  cancel-in-progress: false
+
+jobs:
+  focused-triage:
+    name: Analyze Firmware Interface Strings
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download latest kernel analysis artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+        run: |
+          gh run list \
+            --repo "$GH_REPOSITORY" \
+            --workflow analyze-kernelcache.yml \
+            --status success \
+            --limit 1 \
+            --json databaseId \
+            --jq '.[0].databaseId' > run-id.txt
+
+          RUN_ID="$(cat run-id.txt)"
+
+          if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+            echo "No successful kernel analysis run was found."
+            exit 1
+          fi
+
+          echo "Using successful analysis run: $RUN_ID"
+
+          gh run download "$RUN_ID" \
+            --repo "$GH_REPOSITORY" \
+            --name ios-kernel-static-analysis \
+            --dir input-artifact
+
+      - name: Locate kernel strings
+        run: |
+          STRINGS_FILE="$(find input-artifact -type f \
+            -name 'kernel-strings.txt' -print -quit)"
+
+          if [ -z "$STRINGS_FILE" ]; then
+            echo "kernel-strings.txt was not found in the artifact."
+            find input-artifact -maxdepth 4 -type f -print
+            exit 1
+          fi
+
+          mkdir -p reports
+          cp "$STRINGS_FILE" reports/kernel-strings-input.txt
+
+      - name: Generate focused interface report
+        run: |
+          python - <<'PY'
+          import re
+          from pathlib import Path
+
+          source = Path("reports/kernel-strings-input.txt")
+          output = Path("reports/focused-firmware-triage.txt")
+
+          lines = source.read_text(
+              encoding="utf-8", errors="replace"
+          ).splitlines()
+
+          categories = {
+              "Firmware update interfaces": re.compile(
+                  r"AppleFirmwareUpdateUserClient|"
+                  r"AIDFirmwareUpdateUserClient|"
+                  r"validateFirmware",
+                  re.I,
+              ),
+              "Buffer length and bounds checks": re.compile(
+                  r"bufferLength|classLength|"
+                  r"buffer exceeds maximum bounds|"
+                  r"out of the virtual memory bounds",
+                  re.I,
+              ),
+              "Image4 and firmware processing": re.compile(
+                  r"Image4|image4|firmware|"
+                  r"DFU|mobile-asset",
+                  re.I,
+              ),
+              "IOKit user-client dispatch": re.compile(
+                  r"IOUserClient|externalMethod|"
+                  r"newUserClient|selector",
+                  re.I,
+              ),
+          }
+
+          radius = 3
+          report = [
+              "Focused iOS Kernel Firmware Interface Triage",
+              "=" * 48,
+              "",
+              f"Input: {source}",
+              f"Total strings: {len(lines)}",
+              "",
+              "IMPORTANT:",
+              "String matches are investigative leads only.",
+              "They do not establish a vulnerability, reachability,",
+              "missing validation, or exploitability.",
+              "",
+          ]
+
+          for title, pattern in categories.items():
+              matches = [
+                  index for index, line in enumerate(lines)
+                  if pattern.search(line)
+              ]
+
+              report.extend([
+                  title,
+                  "-" * len(title),
+                  f"Matches: {len(matches)}",
+                  "",
+              ])
+
+              # Show nearby strings while avoiding repeated context.
+              selected = set()
+              for index in matches:
+                  selected.update(
+                      range(max(0, index - radius),
+                            min(len(lines), index + radius + 1))
+                  )
+
+              previous = -2
+              for index in sorted(selected):
+                  if index > previous + 1:
+                      report.append("...")
+                  report.append(f"[line {index + 1}] {lines[index]}")
+                  previous = index
+
+              report.append("")
+
+          output.write_text("\n".join(report) + "\n", encoding="utf-8")
+          print(f"Created {output}")
+          print(f"Source strings: {len(lines)}")
+          for title, pattern in categories.items():
+              count = sum(bool(pattern.search(line)) for line in lines)
+              print(f"{title}: {count} matches")
+          PY
+
+      - name: Upload focused report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-focused-firmware-triage
+          path: reports/focused-firmware-triage.txt
+          if-no-files-found: warn
+          retention-days: 14
