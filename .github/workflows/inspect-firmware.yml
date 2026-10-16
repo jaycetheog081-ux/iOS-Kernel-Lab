@@ -6,9 +6,13 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ios-kernel-lab-firmware-inspection
+  cancel-in-progress: false
+
 jobs:
   inspect:
-    name: Inspect iPhone 13 iOS 27.0
+    name: Extract and fingerprint kernelcache
     runs-on: ubuntu-latest
     timeout-minutes: 360
 
@@ -16,26 +20,40 @@ jobs:
       - name: Check out repository
         uses: actions/checkout@v4
 
-      - name: Show available disk space
-        run: |
-          set -euo pipefail
-          df -h .
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: Inspect firmware
+      - name: Check available disk space
         run: |
-          set -euo pipefail
-          python scripts/inspect_ipsw.py
+          echo "Disk space before download:"
+          df -h
+          echo
+          echo "Target: iPhone14,5 / iOS 27.0 / 24A437"
 
-      - name: Upload inspection reports
+      - name: Download IPSW and extract kernelcache
+        run: python scripts/inspect_ipsw.py
+
+      - name: Show analysis summary
+        if: always()
+        run: |
+          echo "Generated reports:"
+          if [ -d reports ]; then
+            find reports -maxdepth 3 -type f -printf '%p (%s bytes)\n'
+          else
+            echo "No reports directory was created."
+          fi
+
+      - name: Upload kernel analysis artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ios-firmware-report
-          path: reports/
+          name: ios-kernel-analysis
+          path: |
+            reports/kernel-analysis.txt
+            reports/kernel-analysis.json
+            reports/kernelcache/**
           if-no-files-found: warn
-          retention-days: 7
+          retention-days: 14
+          compression-level: 0
