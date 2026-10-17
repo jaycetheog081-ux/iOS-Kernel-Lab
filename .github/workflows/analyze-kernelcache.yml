@@ -54,15 +54,25 @@ jobs:
           ls -lh "$KERNEL"
           sha256sum "$KERNEL"
 
-      - name: Install ipsw analysis tool
+      - name: Install analysis tools
         shell: bash
         run: |
           set -euo pipefail
+
           sudo snap install ipsw
+
+          sudo apt-get update
+          sudo apt-get install -y llvm file
+
           ipsw version || ipsw --version || true
+          llvm-objdump --version
+          llvm-nm --version
 
       - name: Prepare output directory
-        run: mkdir -p reports/kernel-analysis
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p reports/kernel-analysis
 
       - name: Record original kernelcache fingerprint
         env:
@@ -87,6 +97,9 @@ jobs:
             echo
             echo "SHA-256:"
             sha256sum "$KERNEL_PATH"
+            echo
+            echo "File type:"
+            file "$KERNEL_PATH"
             echo
             echo "First 32 bytes:"
             od -An -tx1 -N32 "$KERNEL_PATH"
@@ -136,6 +149,9 @@ jobs:
             echo "SHA-256:"
             sha256sum "$DECODED"
             echo
+            echo "File type:"
+            file "$DECODED"
+            echo
             echo "First 32 bytes:"
             od -An -tx1 -N32 "$DECODED"
           } >> reports/kernel-analysis/kernelcache-report.txt
@@ -160,6 +176,7 @@ jobs:
             echo
             echo "KERNEL VERSION METADATA"
             echo "-----------------------"
+
             if [ -f reports/kernel-analysis/kernel-version.json ]; then
               cat reports/kernel-analysis/kernel-version.json
             else
@@ -191,6 +208,136 @@ jobs:
               reports/kernel-analysis/kernel-strings.txt \
               | head -n 200 || true
           } >> reports/kernel-analysis/kernelcache-report.txt
+
+      - name: Inspect Mach-O headers and sections
+        if: steps.decompress.outcome == 'success'
+        env:
+          DECODED_PATH: ${{ steps.decompress.outputs.decoded_path }}
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          OUT="reports/kernel-analysis/kernel-mach-o-info.txt"
+
+          {
+            echo "Mach-O Kernel Inspection"
+            echo "========================"
+            echo
+            echo "Input: $DECODED_PATH"
+            echo
+            echo "File identification:"
+            file "$DECODED_PATH"
+            echo
+            echo "Architecture and load commands:"
+          } > "$OUT"
+
+          if llvm-objdump --macho --private-headers \
+              "$DECODED_PATH" >> "$OUT" 2>&1; then
+            echo "Mach-O header inspection completed."
+          else
+            {
+              echo
+              echo "The installed LLVM could not parse this file directly."
+              echo "This may require a Mach-O fileset-aware parser."
+            } >> "$OUT"
+          fi
+
+          {
+            echo
+            echo "Section listing:"
+          } >> "$OUT"
+
+          llvm-objdump --macho --section-headers \
+            "$DECODED_PATH" >> "$OUT" 2>&1 || true
+
+          echo "Created $OUT"
+
+      - name: Extract available symbols
+        if: steps.decompress.outcome == 'success'
+        env:
+          DECODED_PATH: ${{ steps.decompress.outputs.decoded_path }}
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          OUT="reports/kernel-analysis/kernel-symbols.txt"
+          FOCUSED="reports/kernel-analysis/kernel-focused-symbols.txt"
+
+          {
+            echo "Kernel Symbol Inspection"
+            echo "========================"
+            echo
+            echo "Input: $DECODED_PATH"
+            echo
+            echo "Symbols depend on whether the binary retains a usable symbol table."
+            echo "An empty result does not establish that a function is absent."
+            echo
+          } > "$OUT"
+
+          if llvm-nm --defined-only "$DECODED_PATH" \
+              >> "$OUT" 2>&1; then
+            echo "LLVM symbol extraction completed."
+          else
+            {
+              echo
+              echo "LLVM could not extract symbols directly."
+              echo "The kernel may be stripped or use a format requiring"
+              echo "additional fileset-aware analysis."
+            } >> "$OUT"
+          fi
+
+          {
+            echo "Focused GPU and firmware symbol candidates"
+            echo "=========================================="
+            echo
+            echo "Candidates found in extracted symbol output:"
+            echo
+          } > "$FOCUSED"
+
+          grep -Ei \
+            'AGXFirmwareRingValidator|AGXArmFirmwareMapper|AGXAcceleratorRing|AGXSecureGart|AppleFirmwareUpdateUserClient|AIDFirmwareUpdateUserClient|Image4|IOUserClient' \
+            "$OUT" >> "$FOCUSED" || true
+
+          if [ "$(wc -l < "$FOCUSED")" -le 6 ]; then
+            {
+              echo
+              echo "No matching symbol names were recovered."
+              echo "This can occur when symbols are stripped or stored separately."
+            } >> "$FOCUSED"
+          fi
+
+          echo "Created $OUT"
+          echo "Created $FOCUSED"
+
+      - name: Create inspection summary
+        if: always()
+        shell: bash
+        run: |
+          set -u
+
+          OUT="reports/kernel-analysis/inspection-summary.txt"
+
+          {
+            echo "Kernel Inspection Summary"
+            echo "========================="
+            echo
+            echo "Target: iPhone 13 (iPhone14,5)"
+            echo "Firmware: iOS 27.0"
+            echo "Build: 24A437"
+            echo
+            echo "This workflow performs static inspection only."
+            echo "It does not establish that a vulnerability exists."
+            echo
+            echo "Generated files:"
+            if [ -d reports/kernel-analysis ]; then
+              find reports/kernel-analysis \
+                -maxdepth 4 \
+                -type f \
+                -printf '%p (%s bytes)\n' | sort
+            fi
+          } > "$OUT"
+
+          cat "$OUT"
 
       - name: Show output summary
         if: always()
