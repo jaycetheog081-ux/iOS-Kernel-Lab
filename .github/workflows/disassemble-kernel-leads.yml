@@ -1,0 +1,241 @@
+name: Disassemble Kernel Investigation Leads
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "Run ID of the successful Analyze iOS Kernelcache workflow"
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: ios-kernel-lab-disassembly
+  cancel-in-progress: false
+
+jobs:
+  disassemble:
+    name: Recover symbols and inspect selected code
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Download existing kernel analysis
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-kernel-static-analysis
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+          path: input
+
+      - name: Locate decompressed kernel
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          KERNEL="$(find input -type f \
+            -name '*.decompressed' -print -quit)"
+
+          if [ -z "$KERNEL" ]; then
+            echo "::error::Decompressed kernelcache not found."
+            find input -type f -print
+            exit 1
+          fi
+
+          echo "kernel_path=$KERNEL" >> "$GITHUB_OUTPUT"
+
+          file "$KERNEL"
+          sha256sum "$KERNEL"
+
+      - name: Install analysis tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo snap install ipsw
+          sudo apt-get update
+          sudo apt-get install -y git python3
+
+          ipsw version || ipsw --version || true
+
+      - name: Obtain kernel signature database
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          git clone --depth 1 \
+            https://github.com/blacktop/symbolicator.git \
+            work-symbolicator
+
+          test -d work-symbolicator/kernel
+
+      - name: Recover kernel symbols
+        env:
+          KERNEL: ${{ steps.locate.outputs.kernel_path }}
+        shell: bash
+        run: |
+          set -u
+
+          mkdir -p reports/symbols
+
+          ipsw kernel symbolicate \
+            --signatures work-symbolicator/kernel \
+            --json \
+            -o reports/symbols \
+            "$KERNEL" \
+            > reports/symbolication.log 2>&1
+
+          STATUS=$?
+
+          echo "Symbolication exit code: $STATUS" \
+            >> reports/symbolication.log
+
+          find reports/symbols -type f -printf '%p (%s bytes)\n' \
+            > reports/symbol-files.txt
+
+      - name: Find recovered target function names
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path("reports/symbols")
+          output = Path("reports/target-symbol-matches.txt")
+
+          targets = [
+              "AGXFirmwareRingValidator",
+              "AGXArmFirmwareMapper",
+              "AGXSecureGart",
+              "AGXAcceleratorRing",
+              "IOGPUMTLEvent",
+              "IOGPUDeviceUserClient",
+              "IOGPUResidentMemorySet",
+              "IOGPUCommandQueue",
+              "AppleFirmwareUpdateUserClient",
+              "validateFirmware",
+              "validateImage4",
+              "Image4UserClient",
+          ]
+
+          matches = []
+
+          def walk(obj, path="$"):
+              if isinstance(obj, dict):
+                  for key, value in obj.items():
+                      key_text = str(key)
+                      value_text = value if isinstance(value, str) else ""
+
+                      if any(t.lower() in
+                             (key_text + " " + value_text).lower()
+                             for t in targets):
+                          matches.append(
+                              f"{path}.{key_text} = {str(value)[:500]}"
+                          )
+
+                      walk(value, f"{path}.{key_text}")
+
+              elif isinstance(obj, list):
+                  for i, value in enumerate(obj):
+                      walk(value, f"{path}[{i}]")
+
+          for path in sorted(root.rglob("*.json")):
+              try:
+                  data = json.loads(path.read_text(errors="replace"))
+                  matches.append(f"\n### {path}")
+                  walk(data)
+              except Exception as exc:
+                  matches.append(f"{path}: JSON read failed: {exc}")
+
+          output.write_text(
+              "\n".join(matches) if matches
+              else "No target names found in generated JSON symbol maps.\n"
+          )
+          PY
+
+      - name: Record available disassembly commands
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo "ipsw kernel symbolicate --help"
+            ipsw kernel symbolicate --help 2>&1 || true
+            echo
+            echo "ipsw macho disass --help"
+            ipsw macho disass --help 2>&1 || true
+          } > reports/disassembly-tool-help.txt
+
+      - name: Extract GPU and firmware-update components
+        env:
+          KERNEL: ${{ steps.locate.outputs.kernel_path }}
+        shell: bash
+        run: |
+          set -u
+
+          mkdir -p work/components reports/component-info
+
+          for COMPONENT in \
+            com.apple.iokit.IOGPUFamily \
+            com.apple.AGXG14P \
+            com.apple.driver.AppleFirmwareUpdateKext \
+            com.apple.security.AppleImage4 \
+            com.apple.security.Image4
+          do
+            LOG="reports/component-info/${COMPONENT}.log"
+
+            ipsw kernel extract "$KERNEL" "$COMPONENT" \
+              --imports \
+              -o work/components \
+              > "$LOG" 2>&1
+
+            STATUS=$?
+
+            echo "Extraction exit code: $STATUS" >> "$LOG"
+          done
+
+          find work/components -type f \
+            -printf '%p (%s bytes)\n' \
+            > reports/extracted-components.txt
+
+      - name: Record component Mach-O metadata
+        shell: bash
+        run: |
+          set -u
+
+          mkdir -p reports/macho-info
+
+          while IFS= read -r COMPONENT; do
+            [ -f "$COMPONENT" ] || continue
+
+            NAME="$(basename "$COMPONENT")"
+
+            ipsw macho info "$COMPONENT" \
+              --header \
+              --loads \
+              > "reports/macho-info/${NAME}.txt" 2>&1
+
+          done < <(find work/components -type f | sort)
+
+      - name: Summarize results
+        if: always()
+        shell: bash
+        run: |
+          echo "Generated reports:"
+          find reports -type f \
+            -printf '%p (%s bytes)\n' | sort || true
+
+      - name: Upload symbol and component results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-kernel-disassembly-leads
+          path: reports/**
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 6
