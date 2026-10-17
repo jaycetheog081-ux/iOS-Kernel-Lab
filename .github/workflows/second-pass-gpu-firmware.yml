@@ -37,7 +37,6 @@ jobs:
 
           if [ -z "$RUN_ID" ]; then
             echo "No successful analyze-kernelcache.yml run was found."
-            echo "Check the workflow filename and run it successfully first."
             exit 1
           fi
 
@@ -64,14 +63,15 @@ jobs:
             -name kernel-strings.txt -print -quit)"
 
           if [ -z "$STRINGS_FILE" ]; then
-            echo "kernel-strings.txt was not found in the downloaded artifact."
+            echo "kernel-strings.txt was not found."
             find input -maxdepth 4 -type f -print
             exit 1
           fi
 
-          cp "$STRINGS_FILE" input/kernel-strings.txt
-          echo "Input file: input/kernel-strings.txt"
-          wc -l input/kernel-strings.txt
+          echo "Using kernel strings: $STRINGS_FILE"
+          wc -l "$STRINGS_FILE"
+
+          echo "STRINGS_FILE=$STRINGS_FILE" >> "$GITHUB_ENV"
 
       - name: Generate focused report
         shell: bash
@@ -80,18 +80,15 @@ jobs:
 
           python3 <<'PY'
           from pathlib import Path
+          import os
           import re
 
-          source = Path("input/kernel-strings.txt")
+          source = Path(os.environ["STRINGS_FILE"])
           output = Path("reports/second-pass-gpu-firmware.txt")
           output.parent.mkdir(parents=True, exist_ok=True)
 
-          lines = source.read_text(
-              errors="replace"
-          ).splitlines()
+          lines = source.read_text(errors="replace").splitlines()
 
-          # Each category uses narrow, component-oriented patterns.
-          # A match is a research lead, not a vulnerability verdict.
           categories = {
               "GPU firmware and ring-buffer handling": [
                   r"AGXFirmwareRingValidator",
@@ -143,26 +140,21 @@ jobs:
               for name, patterns in categories.items()
           }
 
-          report = []
-          report.append("iOS Kernel Second-Pass Static Triage")
-          report.append("=" * 40)
-          report.append(f"Input: {source}")
-          report.append(f"Input strings: {len(lines)}")
-          report.append("")
-          report.append("Target platform reported by previous analysis:")
-          report.append("iPhone 13 (iPhone14,5), iOS 27.0, build 24A437")
-          report.append("")
-          report.append("Interpretation warning:")
-          report.append(
-              "This report searches extracted strings, not executable control "
-              "flow. A diagnostic can indicate a check exists; it does not "
-              "prove the check is missing, incorrect, reachable, or exploitable."
-          )
-          report.append(
-              "Displayed line numbers are indices in kernel-strings.txt, "
-              "not source-code line numbers."
-          )
-          report.append("")
+          report = [
+              "iOS Kernel Second-Pass Static Triage",
+              "=" * 40,
+              f"Input: {source}",
+              f"Input strings: {len(lines)}",
+              "",
+              "Target platform: iPhone 13 (iPhone14,5),",
+              "iOS 27.0, build 24A437",
+              "",
+              "Interpretation warning:",
+              "This report searches extracted strings, not executable control flow.",
+              "A match does not prove a missing check, vulnerability, reachability,",
+              "or exploitability. Reported indices refer to kernel-strings.txt,",
+              "not source-code line numbers.",
+          ]
 
           total_hits = 0
 
@@ -173,63 +165,52 @@ jobs:
                   if any(pattern.search(line) for pattern in patterns):
                       hits.append((index, line.strip()))
 
-              # Remove exact duplicate strings while preserving their indices.
-              seen = set()
+              total_hits += len(hits)
+
               unique_hits = []
+              seen = set()
+
               for index, line in hits:
-                  key = line
-                  if key not in seen:
-                      seen.add(key)
+                  if line not in seen:
+                      seen.add(line)
                       unique_hits.append((index, line))
 
-              total_hits += len(hits)
-              report.append("")
-              report.append("-" * 72)
-              report.append(category)
-              report.append("-" * 72)
-              report.append(f"Matching string indices: {len(hits)}")
-              report.append(f"Unique matching strings: {len(unique_hits)}")
-              report.append("")
+              report.extend([
+                  "",
+                  "-" * 72,
+                  category,
+                  "-" * 72,
+                  f"Matching string indices: {len(hits)}",
+                  f"Unique matching strings: {len(unique_hits)}",
+                  "",
+              ])
 
               if not unique_hits:
                   report.append("No matches found.")
                   continue
 
-              # Keep the report readable and upload the full list of
-              # unique matches up to this per-category cap.
-              limit = 100
-              for index, line in unique_hits[:limit]:
+              for index, line in unique_hits[:100]:
                   report.append(f"[string {index}] {line}")
 
-              if len(unique_hits) > limit:
+              if len(unique_hits) > 100:
                   report.append(
-                      f"... {len(unique_hits) - limit} additional unique "
-                      "matches omitted from this category."
+                      f"... {len(unique_hits) - 100} additional unique "
+                      "matches omitted."
                   )
 
-          report.append("")
-          report.append("=" * 72)
-          report.append("Suggested next evidence to collect")
-          report.append("=" * 72)
-          report.append(
-              "1. Identify the owning binary or driver for a specific lead."
-          )
-          report.append(
-              "2. Inspect the actual function and its caller/callee path."
-          )
-          report.append(
-              "3. Determine whether untrusted input can reach the function."
-          )
-          report.append(
-              "4. Verify lengths, arithmetic, object lifetime, and "
-              "synchronization using executable-code evidence."
-          )
-          report.append(
-              "5. Compare against public advisories without assuming that "
-              "a similar historical CVE affects this build."
-          )
-          report.append("")
-          report.append(f"Raw regex matches across categories: {total_hits}")
+          report.extend([
+              "",
+              "=" * 72,
+              "Recommended next evidence",
+              "=" * 72,
+              "1. Identify the binary or driver associated with a lead.",
+              "2. Inspect relevant executable functions and their callers.",
+              "3. Determine whether untrusted input can reach the function.",
+              "4. Examine bounds, arithmetic, object lifetime, and synchronization.",
+              "5. Compare evidence with public advisories without assuming a CVE applies.",
+              "",
+              f"Raw regex matches across categories: {total_hits}",
+          ])
 
           output.write_text("\n".join(report) + "\n")
           print(f"Created {output}")
