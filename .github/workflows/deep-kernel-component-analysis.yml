@@ -1,0 +1,313 @@
+name: Deep Kernel Component Analysis
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_run_id:
+        description: "Run ID of the successful kernel analysis workflow"
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: ios-kernel-lab-deep-component-analysis
+  cancel-in-progress: false
+
+jobs:
+  inspect:
+    name: Inspect kernel components and symbols
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Download analyzed kernelcache
+        uses: actions/download-artifact@v4
+        with:
+          name: ios-kernel-static-analysis
+          run-id: ${{ inputs.source_run_id }}
+          github-token: ${{ github.token }}
+          path: input
+
+      - name: Locate decompressed kernel
+        id: locate
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          KERNEL="$(find input \
+            -type f \
+            -name '*.decompressed' \
+            -print -quit)"
+
+          if [ -z "$KERNEL" ]; then
+            echo "::error::Decompressed kernelcache not found."
+            find input -maxdepth 5 -type f -print
+            exit 1
+          fi
+
+          echo "kernel_path=$KERNEL" >> "$GITHUB_OUTPUT"
+
+          echo "Kernelcache:"
+          ls -lh "$KERNEL"
+          sha256sum "$KERNEL"
+
+      - name: Install analysis tools
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          sudo snap install ipsw
+          sudo apt-get update
+          sudo apt-get install -y binutils file
+
+          ipsw version || ipsw --version || true
+
+      - name: Prepare reports
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p \
+            reports/component-analysis \
+            reports/target-components \
+            reports/symbols \
+            work/all-kexts
+
+      - name: Record kernel identity
+        env:
+          KERNEL: ${{ steps.locate.outputs.kernel_path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          {
+            echo "Deep Kernel Component Analysis"
+            echo "=============================="
+            echo
+            echo "Device: iPhone14,5"
+            echo "Firmware: iOS 27.0"
+            echo "Build: 24A437"
+            echo
+            echo "Kernel file:"
+            echo "$KERNEL"
+            echo
+            echo "File identification:"
+            file "$KERNEL"
+            echo
+            echo "SHA-256:"
+            sha256sum "$KERNEL"
+            echo
+            echo "Size:"
+            stat -c '%s bytes' "$KERNEL"
+          } > reports/component-analysis/kernel-identity.txt
+
+      - name: Enumerate embedded kernel extensions
+        env:
+          KERNEL: ${{ steps.locate.outputs.kernel_path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ipsw kernel kexts "$KERNEL" \
+            > reports/component-analysis/kernel-kexts.txt 2>&1
+
+          echo "Kernel extension inventory created."
+
+      - name: Recover C++ class information
+        env:
+          KERNEL: ${{ steps.locate.outputs.kernel_path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if ipsw kernel cpp --help \
+            > reports/component-analysis/cpp-help.txt 2>&1; then
+
+            ipsw kernel cpp "$KERNEL" \
+              > reports/component-analysis/kernel-cpp-classes.txt 2>&1 \
+              || echo "C++ class recovery returned an error." \
+                >> reports/component-analysis/kernel-cpp-classes.txt
+          else
+            echo "C++ class command help unavailable." \
+              > reports/component-analysis/kernel-cpp-classes.txt
+          fi
+
+      - name: Recover names for stripped kernel functions
+        env:
+          KERNEL: ${{ steps.locate.outputs.kernel_path }}
+        shell: bash
+        run: |
+          set -u
+
+          ipsw kernel symbolicate \
+            --json \
+            -o reports/symbols/ \
+            "$KERNEL" \
+            > reports/component-analysis/symbolication.log 2>&1 \
+            || echo "Symbolication did not complete successfully." \
+              >> reports/component-analysis/symbolication.log
+
+      - name: Extract embedded kernel components
+        env:
+          KERNEL: ${{ steps.locate.outputs.kernel_path }}
+        shell: bash
+        run: |
+          set -u
+
+          ipsw kernel extract "$KERNEL" \
+            --all \
+            --imports \
+            -o work/all-kexts \
+            > reports/component-analysis/kext-extraction.log 2>&1
+
+          STATUS=$?
+
+          echo "Extraction exit code: $STATUS" \
+            >> reports/component-analysis/kext-extraction.log
+
+          if [ "$STATUS" -ne 0 ]; then
+            echo "::warning::Component extraction was incomplete. Review the extraction log."
+          fi
+
+          echo "Extracted component files:"
+          find work/all-kexts -type f -printf '%f (%s bytes)\n' \
+            | sort \
+            > reports/component-analysis/extracted-components.txt
+
+          if [ ! -s reports/component-analysis/extracted-components.txt ]; then
+            echo "No component files were extracted." \
+              >> reports/component-analysis/extracted-components.txt
+          fi
+
+      - name: Select GPU, firmware-update and Image4 components
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          : > reports/component-analysis/selected-component-files.txt
+
+          find work/all-kexts -type f -print0 |
+          while IFS= read -r -d '' COMPONENT; do
+            NAME="$(basename "$COMPONENT")"
+
+            if printf '%s\n' "$NAME" |
+              grep -Eiq \
+              'AGX|GPU|FirmwareUpdate|Image4|AppleImage4|IOGPU|TXM|RTBuddy'; then
+
+              DEST="reports/target-components/$NAME"
+
+              if [ -e "$DEST" ]; then
+                HASH="$(sha256sum "$COMPONENT" | awk '{print $1}')"
+                DEST="reports/target-components/${NAME}.${HASH:0:12}"
+              fi
+
+              cp "$COMPONENT" "$DEST"
+
+              printf '%s -> %s\n' "$COMPONENT" "$DEST" \
+                >> reports/component-analysis/selected-component-files.txt
+            fi
+          done
+
+          if [ ! -s reports/component-analysis/selected-component-files.txt ]; then
+            echo "No matching components were identified by filename." \
+              > reports/component-analysis/selected-component-files.txt
+          fi
+
+      - name: Inspect selected component strings
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUTPUT="reports/component-analysis/target-component-strings.txt"
+
+          {
+            echo "Target Component String Analysis"
+            echo "================================"
+            echo
+
+            while IFS= read -r COMPONENT; do
+              [ -f "$COMPONENT" ] || continue
+
+              echo
+              echo "### Component: $(basename "$COMPONENT")"
+              echo "Path: $COMPONENT"
+              echo "SHA-256:"
+              sha256sum "$COMPONENT"
+              echo
+
+              strings -a -n 6 "$COMPONENT" |
+                grep -Ei \
+                'AGXFirmwareRingValidator|AGXAcceleratorRing|AGXArmFirmwareMapper|AGXSecureGart|AppleFirmwareUpdateUserClient|AIDFirmwareUpdateUserClient|validateFirmware|externalMethod|bufferLength|classLength|Image4|TXM|overflow|out.of.bounds|bounds check|entitlement|iovmMapMemory|iovmUnmapMemory|mapInThisGart|unmapFromThisGart|ring index|firmware descriptor|firmware map' \
+                | sort -u \
+                | head -n 1500 || true
+            done < <(
+              find reports/target-components -type f -print | sort
+            )
+          } > "$OUTPUT"
+
+      - name: Build focused investigation summary
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          OUT="reports/component-analysis/investigation-summary.txt"
+
+          {
+            echo "Focused Kernel Investigation Summary"
+            echo "===================================="
+            echo
+            echo "Target: iPhone14,5"
+            echo "Firmware: iOS 27.0 (24A437)"
+            echo
+            echo "Prioritized investigation areas:"
+            echo
+            echo "1. GPU ring validation and index handling"
+            echo "   - AGXFirmwareRingValidator"
+            echo "   - AGXAcceleratorRing"
+            echo "   - Read/write index consistency"
+            echo
+            echo "2. GPU memory mapping and cleanup"
+            echo "   - AGXArmFirmwareMapper"
+            echo "   - AGXSecureGart"
+            echo "   - Mapping lengths and resource lifetimes"
+            echo
+            echo "3. Firmware-update input validation"
+            echo "   - AppleFirmwareUpdateUserClient"
+            echo "   - AIDFirmwareUpdateUserClient"
+            echo "   - External method argument and buffer validation"
+            echo
+            echo "4. Image4/TXM argument and range validation"
+            echo "   - Input lengths and argument counts"
+            echo "   - Integer overflow and range handling"
+            echo
+            echo "Component files selected:"
+            cat reports/component-analysis/selected-component-files.txt
+            echo
+            echo "Important limitation:"
+            echo "Matching strings do not establish a vulnerability."
+            echo "A finding requires analysis of executable code, input"
+            echo "reachability, validation, and the relevant failure path."
+          } > "$OUT"
+
+      - name: List generated reports
+        if: always()
+        shell: bash
+        run: |
+          echo "Generated reports and selected components:"
+          find reports -type f -printf '%p (%s bytes)\n' | sort || true
+
+      - name: Upload focused component analysis
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-deep-kernel-component-analysis
+          path: |
+            reports/component-analysis/**
+            reports/target-components/**
+            reports/symbols/**
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 6
