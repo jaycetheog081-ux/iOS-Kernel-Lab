@@ -1,0 +1,245 @@
+name: Second-Pass GPU and Firmware Analysis
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  focused-analysis:
+    name: Analyze GPU and Firmware Leads
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Locate latest successful kernel analysis
+        id: source
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          RUN_ID="$(
+            gh run list \
+              --repo "$GH_REPO" \
+              --workflow analyze-kernelcache.yml \
+              --status success \
+              --limit 1 \
+              --json databaseId \
+              --jq '.[0].databaseId // empty'
+          )"
+
+          if [ -z "$RUN_ID" ]; then
+            echo "No successful analyze-kernelcache.yml run was found."
+            echo "Check the workflow filename and run it successfully first."
+            exit 1
+          fi
+
+          echo "Using kernel-analysis run: $RUN_ID"
+          echo "run_id=$RUN_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Download kernel strings artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ steps.source.outputs.run_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p input
+
+          gh run download "$RUN_ID" \
+            --repo "$GH_REPO" \
+            --name ios-kernel-static-analysis \
+            --dir input
+
+          STRINGS_FILE="$(find input -type f \
+            -name kernel-strings.txt -print -quit)"
+
+          if [ -z "$STRINGS_FILE" ]; then
+            echo "kernel-strings.txt was not found in the downloaded artifact."
+            find input -maxdepth 4 -type f -print
+            exit 1
+          fi
+
+          cp "$STRINGS_FILE" input/kernel-strings.txt
+          echo "Input file: input/kernel-strings.txt"
+          wc -l input/kernel-strings.txt
+
+      - name: Generate focused report
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          source = Path("input/kernel-strings.txt")
+          output = Path("reports/second-pass-gpu-firmware.txt")
+          output.parent.mkdir(parents=True, exist_ok=True)
+
+          lines = source.read_text(
+              errors="replace"
+          ).splitlines()
+
+          # Each category uses narrow, component-oriented patterns.
+          # A match is a research lead, not a vulnerability verdict.
+          categories = {
+              "GPU firmware and ring-buffer handling": [
+                  r"AGXFirmwareRingValidator",
+                  r"AGXArmFirmwareMapper",
+                  r"AGXAcceleratorRing",
+                  r"AGXSecureGart",
+                  r"ring.{0,35}(?:index|buffer|overflow|bounds|range)",
+                  r"(?:index|buffer|overflow|bounds|range).{0,35}ring",
+                  r"(?:GPU|AGX).{0,50}(?:mapping|bounds|overflow|length)",
+                  r"(?:mapping|bounds|overflow|length).{0,50}(?:GPU|AGX)",
+              ],
+              "Firmware-update user clients": [
+                  r"AppleFirmwareUpdateUserClient",
+                  r"AIDFirmwareUpdateUserClient",
+                  r"validateFirmwareGated",
+                  r"validateFirmware",
+                  r"skipFWValidation",
+                  r"_firmwareDescriptor",
+                  r"_firmwareMap",
+                  r"inputMD->prepare",
+                  r"bufferLength must be",
+                  r"classLength",
+                  r"firmware.{0,45}(?:entitlement|privileg|bounds|length)",
+              ],
+              "Image4 and TXM argument handling": [
+                  r"image4 dispatch: overflow",
+                  r"overflow on range to be reclaimed from TXM",
+                  r"unsupported AppleImage4 interface",
+                  r"excessive return words from TXM",
+                  r"invalid number of arguments to TXM",
+                  r"Image4.{0,50}(?:overflow|bounds|length|argument)",
+                  r"TXM.{0,50}(?:overflow|bounds|length|argument)",
+              ],
+              "User-client dispatch and validation": [
+                  r"IOUserClient inputCount count mismatch",
+                  r"IOUserClient outputCount count mismatch",
+                  r"externalMethod.*(?:selector|count|invalid|entitlement)",
+                  r"selector %d >= count %d",
+                  r"no entitlement for selector",
+                  r"user buffer exceeds maximum bounds",
+                  r"user buffer length is zero",
+                  r"user buffer is null",
+                  r"copyin failed",
+              ],
+          }
+
+          compiled = {
+              name: [re.compile(p, re.IGNORECASE) for p in patterns]
+              for name, patterns in categories.items()
+          }
+
+          report = []
+          report.append("iOS Kernel Second-Pass Static Triage")
+          report.append("=" * 40)
+          report.append(f"Input: {source}")
+          report.append(f"Input strings: {len(lines)}")
+          report.append("")
+          report.append("Target platform reported by previous analysis:")
+          report.append("iPhone 13 (iPhone14,5), iOS 27.0, build 24A437")
+          report.append("")
+          report.append("Interpretation warning:")
+          report.append(
+              "This report searches extracted strings, not executable control "
+              "flow. A diagnostic can indicate a check exists; it does not "
+              "prove the check is missing, incorrect, reachable, or exploitable."
+          )
+          report.append(
+              "Displayed line numbers are indices in kernel-strings.txt, "
+              "not source-code line numbers."
+          )
+          report.append("")
+
+          total_hits = 0
+
+          for category, patterns in compiled.items():
+              hits = []
+
+              for index, line in enumerate(lines, start=1):
+                  if any(pattern.search(line) for pattern in patterns):
+                      hits.append((index, line.strip()))
+
+              # Remove exact duplicate strings while preserving their indices.
+              seen = set()
+              unique_hits = []
+              for index, line in hits:
+                  key = line
+                  if key not in seen:
+                      seen.add(key)
+                      unique_hits.append((index, line))
+
+              total_hits += len(hits)
+              report.append("")
+              report.append("-" * 72)
+              report.append(category)
+              report.append("-" * 72)
+              report.append(f"Matching string indices: {len(hits)}")
+              report.append(f"Unique matching strings: {len(unique_hits)}")
+              report.append("")
+
+              if not unique_hits:
+                  report.append("No matches found.")
+                  continue
+
+              # Keep the report readable and upload the full list of
+              # unique matches up to this per-category cap.
+              limit = 100
+              for index, line in unique_hits[:limit]:
+                  report.append(f"[string {index}] {line}")
+
+              if len(unique_hits) > limit:
+                  report.append(
+                      f"... {len(unique_hits) - limit} additional unique "
+                      "matches omitted from this category."
+                  )
+
+          report.append("")
+          report.append("=" * 72)
+          report.append("Suggested next evidence to collect")
+          report.append("=" * 72)
+          report.append(
+              "1. Identify the owning binary or driver for a specific lead."
+          )
+          report.append(
+              "2. Inspect the actual function and its caller/callee path."
+          )
+          report.append(
+              "3. Determine whether untrusted input can reach the function."
+          )
+          report.append(
+              "4. Verify lengths, arithmetic, object lifetime, and "
+              "synchronization using executable-code evidence."
+          )
+          report.append(
+              "5. Compare against public advisories without assuming that "
+              "a similar historical CVE affects this build."
+          )
+          report.append("")
+          report.append(f"Raw regex matches across categories: {total_hits}")
+
+          output.write_text("\n".join(report) + "\n")
+          print(f"Created {output}")
+          print(f"Report lines: {len(report)}")
+          PY
+
+      - name: Upload focused report
+        uses: actions/upload-artifact@v4
+        with:
+          name: ios-second-pass-gpu-firmware
+          path: reports/second-pass-gpu-firmware.txt
+          if-no-files-found: error
+          retention-days: 14
